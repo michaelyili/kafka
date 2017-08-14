@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.connect.runtime;
 
+import org.apache.kafka.connect.runtime.isolation.Plugins;
 import org.apache.kafka.connect.util.ConnectorTaskId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,6 +40,7 @@ abstract class WorkerTask implements Runnable {
 
     protected final ConnectorTaskId id;
     private final TaskStatus.Listener statusListener;
+    protected final ClassLoader loader;
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
     private volatile TargetState targetState;
     private volatile boolean stopping;   // indicates whether the Worker has asked the task to stop
@@ -46,9 +48,11 @@ abstract class WorkerTask implements Runnable {
 
     public WorkerTask(ConnectorTaskId id,
                       TaskStatus.Listener statusListener,
-                      TargetState initialState) {
+                      TargetState initialState,
+                      ClassLoader loader) {
         this.id = id;
         this.statusListener = statusListener;
+        this.loader = loader;
         this.targetState = initialState;
         this.stopping = false;
         this.cancelled = false;
@@ -56,6 +60,10 @@ abstract class WorkerTask implements Runnable {
 
     public ConnectorTaskId id() {
         return id;
+    }
+
+    public ClassLoader loader() {
+        return loader;
     }
 
     /**
@@ -116,7 +124,7 @@ abstract class WorkerTask implements Runnable {
         try {
             close();
         } catch (Throwable t) {
-            log.error("Task {} threw an uncaught and unrecoverable exception during shutdown", id, t);
+            log.error("{} Task threw an uncaught and unrecoverable exception during shutdown", this, t);
             throw t;
         }
     }
@@ -137,8 +145,8 @@ abstract class WorkerTask implements Runnable {
 
             execute();
         } catch (Throwable t) {
-            log.error("Task {} threw an uncaught and unrecoverable exception", id, t);
-            log.error("Task is being killed and will not recover until manually restarted");
+            log.error("{} Task threw an uncaught and unrecoverable exception", this, t);
+            log.error("{} Task is being killed and will not recover until manually restarted", this);
             throw t;
         } finally {
             doClose();
@@ -177,6 +185,7 @@ abstract class WorkerTask implements Runnable {
 
     @Override
     public void run() {
+        ClassLoader savedLoader = Plugins.compareAndSwapLoaders(loader);
         try {
             doRun();
             onShutdown();
@@ -186,6 +195,7 @@ abstract class WorkerTask implements Runnable {
             if (t instanceof Error)
                 throw (Error) t;
         } finally {
+            Plugins.compareAndSwapLoaders(savedLoader);
             shutdownLatch.countDown();
         }
     }

@@ -25,6 +25,7 @@ import org.apache.kafka.test.MockProcessorContext;
 import org.apache.kafka.test.NoOpRecordCollector;
 import org.apache.kafka.test.SegmentedBytesStoreStub;
 import org.apache.kafka.test.TestUtils;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -37,35 +38,41 @@ import static org.junit.Assert.assertTrue;
 
 public class ChangeLoggingSegmentedBytesStoreTest {
 
+    private final NoOpRecordCollector collector = new NoOpRecordCollector() {
+        @Override
+        public <K, V> void send(final String topic,
+                                K key,
+                                V value,
+                                Integer partition,
+                                Long timestamp,
+                                Serializer<K> keySerializer,
+                                Serializer<V> valueSerializer) {
+            sent.put(key, value);
+        }
+    };
+    private final MockProcessorContext context = new MockProcessorContext(
+        TestUtils.tempDirectory(),
+        Serdes.String(),
+        Serdes.Long(),
+        collector,
+        new ThreadCache("testCache", 0, new MockStreamsMetrics(new Metrics())));
+
     private final SegmentedBytesStoreStub bytesStore = new SegmentedBytesStoreStub();
     private final ChangeLoggingSegmentedBytesStore store = new ChangeLoggingSegmentedBytesStore(bytesStore);
     private final Map sent = new HashMap<>();
 
-    @SuppressWarnings("unchecked")
     @Before
     public void setUp() throws Exception {
-        final NoOpRecordCollector collector = new NoOpRecordCollector() {
-            @Override
-            public <K, V> void send(final String topic,
-                                    K key,
-                                    V value,
-                                    Integer partition,
-                                    Long timestamp,
-                                    Serializer<K> keySerializer,
-                                    Serializer<V> valueSerializer) {
-                sent.put(key, value);
-            }
-        };
-        final MockProcessorContext context = new MockProcessorContext(TestUtils.tempDirectory(),
-                                                                      Serdes.String(),
-                                                                      Serdes.Long(),
-                                                                      collector,
-                                                                      new ThreadCache("testCache", 0, new MockStreamsMetrics(new Metrics())));
         context.setTime(0);
         store.init(context, store);
     }
 
-    @SuppressWarnings("unchecked")
+    @After
+    public void after() {
+        context.close();
+        store.close();
+    }
+
     @Test
     public void shouldLogPuts() throws Exception {
         final byte[] value1 = {0};
@@ -79,7 +86,6 @@ public class ChangeLoggingSegmentedBytesStoreTest {
         assertArrayEquals(value2, (byte[]) sent.get(key2));
     }
 
-    @SuppressWarnings("unchecked")
     @Test
     public void shouldLogRemoves() throws Exception {
         final Bytes key1 = Bytes.wrap(new byte[]{0});

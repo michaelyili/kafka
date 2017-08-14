@@ -17,6 +17,7 @@
 package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.MockConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetResetStrategy;
@@ -24,17 +25,20 @@ import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.AuthorizationException;
 import org.apache.kafka.common.errors.WakeupException;
-import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.errors.ProcessorStateException;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.processor.TaskId;
-import org.apache.kafka.streams.state.internals.ThreadCache;
+import org.apache.kafka.test.MockStateRestoreListener;
 import org.apache.kafka.test.TestUtils;
 import org.junit.Test;
 
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
 
 public class AbstractTaskTest {
 
@@ -42,25 +46,29 @@ public class AbstractTaskTest {
     public void shouldThrowProcessorStateExceptionOnInitializeOffsetsWhenAuthorizationException() throws Exception {
         final Consumer consumer = mockConsumer(new AuthorizationException("blah"));
         final AbstractTask task = createTask(consumer);
-        task.initializeOffsetLimits();
+        task.updateOffsetLimits();
     }
 
     @Test(expected = ProcessorStateException.class)
     public void shouldThrowProcessorStateExceptionOnInitializeOffsetsWhenKafkaException() throws Exception {
         final Consumer consumer = mockConsumer(new KafkaException("blah"));
         final AbstractTask task = createTask(consumer);
-        task.initializeOffsetLimits();
+        task.updateOffsetLimits();
     }
 
     @Test(expected = WakeupException.class)
     public void shouldThrowWakeupExceptionOnInitializeOffsetsWhenWakeupException() throws Exception {
         final Consumer consumer = mockConsumer(new WakeupException());
         final AbstractTask task = createTask(consumer);
-        task.initializeOffsetLimits();
+        task.updateOffsetLimits();
     }
 
     private AbstractTask createTask(final Consumer consumer) {
         final MockTime time = new MockTime();
+        final Properties properties = new Properties();
+        properties.put(StreamsConfig.APPLICATION_ID_CONFIG, "app-id");
+        properties.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummyhost:9092");
+        final StreamsConfig config = new StreamsConfig(properties);
         return new AbstractTask(new TaskId(0, 0),
                                 "app",
                                 Collections.singletonList(new TopicPartition("t", 0)),
@@ -71,33 +79,60 @@ public class AbstractTaskTest {
                                                       Collections.<String, String>emptyMap(),
                                                       Collections.<StateStore>emptyList()),
                                 consumer,
-                                new StoreChangelogReader(consumer, Time.SYSTEM, 5000),
+                                new StoreChangelogReader(consumer, Time.SYSTEM, 5000, new MockStateRestoreListener()),
                                 false,
                                 new StateDirectory("app", TestUtils.tempDirectory().getPath(), time),
-                                new ThreadCache("testCache", 0, new MockStreamsMetrics(new Metrics()))) {
+                                config) {
             @Override
-            public void commit() {
-                // do nothing
+            public void resume() {}
+
+            @Override
+            public void commit() {}
+
+            @Override
+            public void suspend() {}
+
+            @Override
+            public void close(final boolean clean) {}
+
+            @Override
+            public void closeSuspended(final boolean clean, final RuntimeException e) {
+
             }
 
             @Override
-            public void close() {
-
+            public Map<TopicPartition, Long> checkpointedOffsets() {
+                return null;
             }
 
             @Override
-            public void initTopology() {
-
+            public boolean process() {
+                return false;
             }
 
             @Override
-            public void closeTopology() {
-
+            public boolean maybePunctuateStreamTime() {
+                return false;
             }
 
             @Override
-            public void commitOffsets() {
-                // do nothing
+            public boolean maybePunctuateSystemTime() {
+                return false;
+            }
+
+            @Override
+            public List<ConsumerRecord<byte[], byte[]>> update(final TopicPartition partition, final List<ConsumerRecord<byte[], byte[]>> remaining) {
+                return null;
+            }
+
+            @Override
+            public int addRecords(final TopicPartition partition, final Iterable<ConsumerRecord<byte[], byte[]>> records) {
+                return 0;
+            }
+
+            @Override
+            public boolean commitNeeded() {
+                return false;
             }
         };
     }

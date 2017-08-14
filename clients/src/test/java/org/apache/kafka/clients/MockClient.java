@@ -65,7 +65,7 @@ public class MockClient implements KafkaClient {
     private final Time time;
     private final Metadata metadata;
     private Set<String> unavailableTopics;
-    private int correlation = 0;
+    private Cluster cluster;
     private Node node = null;
     private final Set<String> ready = new HashSet<>();
     private final Map<Node, Long> blackedOut = new HashMap<>();
@@ -127,6 +127,7 @@ public class MockClient implements KafkaClient {
         return isBlackedOut(node);
     }
 
+    @Override
     public void disconnect(String node) {
         long now = time.milliseconds();
         Iterator<ClientRequest> iter = requests.iterator();
@@ -149,11 +150,13 @@ public class MockClient implements KafkaClient {
             FutureResponse futureResp = iterator.next();
             if (futureResp.node != null && !request.destination().equals(futureResp.node.idString()))
                 continue;
-            short usableVersion = nodeApiVersions.usableVersion(request.requestBuilder().apiKey());
-            AbstractRequest abstractRequest = request.requestBuilder().build(usableVersion);
+
+            AbstractRequest.Builder<?> builder = request.requestBuilder();
+            short version = nodeApiVersions.usableVersion(request.apiKey(), builder.desiredVersion());
+            AbstractRequest abstractRequest = request.requestBuilder().build(version);
             if (!futureResp.requestMatcher.matches(abstractRequest))
-                throw new IllegalStateException("Next in line response did not match expected request");
-            ClientResponse resp = new ClientResponse(request.makeHeader(usableVersion), request.callback(), request.destination(),
+                throw new IllegalStateException("Request matcher did not match next-in-line request " + abstractRequest);
+            ClientResponse resp = new ClientResponse(request.makeHeader(version), request.callback(), request.destination(),
                     request.createdTimeMs(), time.milliseconds(), futureResp.disconnected, null, futureResp.responseBody);
             responses.add(resp);
             iterator.remove();
@@ -169,6 +172,8 @@ public class MockClient implements KafkaClient {
 
         if (metadata != null && metadata.updateRequested()) {
             MetadataUpdate metadataUpdate = metadataUpdates.poll();
+            if (cluster != null)
+                metadata.update(cluster, this.unavailableTopics, time.milliseconds());
             if (metadataUpdate == null)
                 metadata.update(metadata.fetch(), this.unavailableTopics, time.milliseconds());
             else {
@@ -177,8 +182,8 @@ public class MockClient implements KafkaClient {
             }
         }
 
-        while (!this.responses.isEmpty()) {
-            ClientResponse response = this.responses.poll();
+        ClientResponse response;
+        while ((response = this.responses.poll()) != null) {
             response.onComplete();
         }
 
@@ -191,6 +196,18 @@ public class MockClient implements KafkaClient {
 
     public void respond(AbstractResponse response) {
         respond(response, false);
+    }
+
+    public void respond(RequestMatcher matcher, AbstractResponse response) {
+        ClientRequest nextRequest = requests.peek();
+        if (nextRequest == null)
+            throw new IllegalStateException("No current requests queued");
+
+        AbstractRequest request = nextRequest.requestBuilder().build();
+        if (!matcher.matches(request))
+            throw new IllegalStateException("Request matcher did not match next-in-line request " + request);
+
+        respond(response);
     }
 
     public void respond(AbstractResponse response, boolean disconnected) {
@@ -290,6 +307,10 @@ public class MockClient implements KafkaClient {
         this.node = node;
     }
 
+    public void cluster(Cluster cluster) {
+        this.cluster = cluster;
+    }
+
     @Override
     public int inFlightRequestCount() {
         return requests.size();
@@ -313,6 +334,11 @@ public class MockClient implements KafkaClient {
     @Override
     public boolean hasInFlightRequests(String node) {
         return inFlightRequestCount(node) > 0;
+    }
+
+    @Override
+    public boolean hasReadyNodes() {
+        return !ready.isEmpty();
     }
 
     @Override
