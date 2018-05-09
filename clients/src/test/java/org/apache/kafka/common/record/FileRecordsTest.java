@@ -17,6 +17,10 @@
 package org.apache.kafka.common.record;
 
 import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.utils.MockTime;
+import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.test.TestUtils;
 import org.easymock.EasyMock;
@@ -38,6 +42,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import static org.junit.Assert.assertArrayEquals;
 
 public class FileRecordsTest {
 
@@ -47,10 +52,12 @@ public class FileRecordsTest {
             "ijkl".getBytes()
     };
     private FileRecords fileRecords;
+    private Time time;
 
     @Before
     public void setup() throws IOException {
         this.fileRecords = createFileRecords(values);
+        this.time = new MockTime();
     }
 
     /**
@@ -114,17 +121,44 @@ public class FileRecordsTest {
     @Test
     public void testRead() throws IOException {
         FileRecords read = fileRecords.read(0, fileRecords.sizeInBytes());
+        assertEquals(fileRecords.sizeInBytes(), read.sizeInBytes());
         TestUtils.checkEquals(fileRecords.batches(), read.batches());
 
         List<RecordBatch> items = batches(read);
+        RecordBatch first = items.get(0);
+
+        // read from second message until the end
+        read = fileRecords.read(first.sizeInBytes(), fileRecords.sizeInBytes() - first.sizeInBytes());
+        assertEquals(fileRecords.sizeInBytes() - first.sizeInBytes(), read.sizeInBytes());
+        assertEquals("Read starting from the second message", items.subList(1, items.size()), batches(read));
+
+        // read from second message and size is past the end of the file
+        read = fileRecords.read(first.sizeInBytes(), fileRecords.sizeInBytes());
+        assertEquals(fileRecords.sizeInBytes() - first.sizeInBytes(), read.sizeInBytes());
+        assertEquals("Read starting from the second message", items.subList(1, items.size()), batches(read));
+
+        // read from second message and position + size overflows
+        read = fileRecords.read(first.sizeInBytes(), Integer.MAX_VALUE);
+        assertEquals(fileRecords.sizeInBytes() - first.sizeInBytes(), read.sizeInBytes());
+        assertEquals("Read starting from the second message", items.subList(1, items.size()), batches(read));
+
+        // read from second message and size is past the end of the file on a view/slice
+        read = fileRecords.read(1, fileRecords.sizeInBytes() - 1)
+                .read(first.sizeInBytes() - 1, fileRecords.sizeInBytes());
+        assertEquals(fileRecords.sizeInBytes() - first.sizeInBytes(), read.sizeInBytes());
+        assertEquals("Read starting from the second message", items.subList(1, items.size()), batches(read));
+
+        // read from second message and position + size overflows on a view/slice
+        read = fileRecords.read(1, fileRecords.sizeInBytes() - 1)
+                .read(first.sizeInBytes() - 1, Integer.MAX_VALUE);
+        assertEquals(fileRecords.sizeInBytes() - first.sizeInBytes(), read.sizeInBytes());
+        assertEquals("Read starting from the second message", items.subList(1, items.size()), batches(read));
+
+        // read a single message starting from second message
         RecordBatch second = items.get(1);
-
-        read = fileRecords.read(second.sizeInBytes(), fileRecords.sizeInBytes());
-        assertEquals("Try a read starting from the second message",
-                items.subList(1, 3), batches(read));
-
-        read = fileRecords.read(second.sizeInBytes(), second.sizeInBytes());
-        assertEquals("Try a read of a single message starting from the second message",
+        read = fileRecords.read(first.sizeInBytes(), second.sizeInBytes());
+        assertEquals(second.sizeInBytes(), read.sizeInBytes());
+        assertEquals("Read a single message starting from the second message",
                 Collections.singletonList(second), batches(read));
     }
 
@@ -310,7 +344,7 @@ public class FileRecordsTest {
         int start = fileRecords.searchForOffsetWithSize(1, 0).position;
         int size = batch.sizeInBytes();
         FileRecords slice = fileRecords.read(start, size - 1);
-        Records messageV0 = slice.downConvert(RecordBatch.MAGIC_VALUE_V0, 0);
+        Records messageV0 = slice.downConvert(RecordBatch.MAGIC_VALUE_V0, 0, time).records();
         assertTrue("No message should be there", batches(messageV0).isEmpty());
         assertEquals("There should be " + (size - 1) + " bytes", size - 1, messageV0.sizeInBytes());
     }
@@ -327,6 +361,11 @@ public class FileRecordsTest {
 
     private void doTestConversion(CompressionType compressionType, byte toMagic) throws IOException {
         List<Long> offsets = asList(0L, 2L, 3L, 9L, 11L, 15L, 16L, 17L, 22L, 24L);
+
+        Header[] headers = {new RecordHeader("headerKey1", "headerValue1".getBytes()),
+                            new RecordHeader("headerKey2", "headerValue2".getBytes()),
+                            new RecordHeader("headerKey3", "headerValue3".getBytes())};
+
         List<SimpleRecord> records = asList(
                 new SimpleRecord(1L, "k1".getBytes(), "hello".getBytes()),
                 new SimpleRecord(2L, "k2".getBytes(), "goodbye".getBytes()),
@@ -335,9 +374,10 @@ public class FileRecordsTest {
                 new SimpleRecord(5L, "k5".getBytes(), "hello again".getBytes()),
                 new SimpleRecord(6L, "k6".getBytes(), "I sense indecision".getBytes()),
                 new SimpleRecord(7L, "k7".getBytes(), "what now".getBytes()),
-                new SimpleRecord(8L, "k8".getBytes(), "running out".getBytes()),
+                new SimpleRecord(8L, "k8".getBytes(), "running out".getBytes(), headers),
                 new SimpleRecord(9L, "k9".getBytes(), "ok, almost done".getBytes()),
-                new SimpleRecord(10L, "k10".getBytes(), "finally".getBytes()));
+                new SimpleRecord(10L, "k10".getBytes(), "finally".getBytes(), headers));
+        assertEquals("incorrect test setup", offsets.size(), records.size());
 
         ByteBuffer buffer = ByteBuffer.allocate(1024);
         MemoryRecordsBuilder builder = MemoryRecords.builder(buffer, RecordBatch.MAGIC_VALUE_V0, compressionType,
@@ -362,7 +402,7 @@ public class FileRecordsTest {
         try (FileRecords fileRecords = FileRecords.open(tempFile())) {
             fileRecords.append(MemoryRecords.readableRecords(buffer));
             fileRecords.flush();
-            Records convertedRecords = fileRecords.downConvert(toMagic, 0L);
+            Records convertedRecords = fileRecords.downConvert(toMagic, 0L, time).records();
             verifyConvertedRecords(records, offsets, convertedRecords, compressionType, toMagic);
 
             if (toMagic <= RecordBatch.MAGIC_VALUE_V1 && compressionType == CompressionType.NONE) {
@@ -371,7 +411,7 @@ public class FileRecordsTest {
                     firstOffset = 11L; // v1 record
                 else
                     firstOffset = 17; // v2 record
-                Records convertedRecords2 = fileRecords.downConvert(toMagic, firstOffset);
+                Records convertedRecords2 = fileRecords.downConvert(toMagic, firstOffset, time).records();
                 List<Long> filteredOffsets = new ArrayList<>(offsets);
                 List<SimpleRecord> filteredRecords = new ArrayList<>(records);
                 int index = filteredOffsets.indexOf(firstOffset) - 1;
@@ -380,7 +420,7 @@ public class FileRecordsTest {
                 verifyConvertedRecords(filteredRecords, filteredOffsets, convertedRecords2, compressionType, toMagic);
             } else {
                 // firstOffset doesn't have any effect in this case
-                Records convertedRecords2 = fileRecords.downConvert(toMagic, 10L);
+                Records convertedRecords2 = fileRecords.downConvert(toMagic, 10L, time).records();
                 verifyConvertedRecords(records, offsets, convertedRecords2, compressionType, toMagic);
             }
         }
@@ -421,6 +461,7 @@ public class FileRecordsTest {
                     assertEquals("Timestamp should not change", initialRecords.get(i).timestamp(), record.timestamp());
                     assertFalse(record.hasTimestampType(TimestampType.CREATE_TIME));
                     assertFalse(record.hasTimestampType(TimestampType.NO_TIMESTAMP_TYPE));
+                    assertArrayEquals("Headers should not change", initialRecords.get(i).headers(), record.headers());
                 }
                 i += 1;
             }

@@ -49,7 +49,7 @@ import java.util.concurrent.CountDownLatch;
  */
 public class WordCountProcessorDemo {
 
-    private static class MyProcessorSupplier implements ProcessorSupplier<String, String> {
+    static class MyProcessorSupplier implements ProcessorSupplier<String, String> {
 
         @Override
         public Processor<String, String> get() {
@@ -98,10 +98,6 @@ public class WordCountProcessorDemo {
                 }
 
                 @Override
-                @Deprecated
-                public void punctuate(long timestamp) {}
-
-                @Override
                 public void close() {}
             };
         }
@@ -123,7 +119,11 @@ public class WordCountProcessorDemo {
         builder.addSource("Source", "streams-plaintext-input");
 
         builder.addProcessor("Process", new MyProcessorSupplier(), "Source");
-        builder.addStateStore(Stores.create("Counts").withStringKeys().withIntegerValues().inMemory().build(), "Process");
+        builder.addStateStore(Stores.keyValueStoreBuilder(
+                Stores.inMemoryKeyValueStore("Counts"),
+                Serdes.String(),
+                Serdes.Integer()),
+                              "Process");
 
         builder.addSink("Sink", "streams-wordcount-processor-output", "Process");
 

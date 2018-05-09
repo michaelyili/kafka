@@ -26,7 +26,7 @@ import java.util.Map;
  */
 public class Serdes {
 
-    static protected class WrapperSerde<T> implements Serde<T> {
+    static public class WrapperSerde<T> implements Serde<T> {
         final private Serializer<T> serializer;
         final private Deserializer<T> deserializer;
 
@@ -151,7 +151,8 @@ public class Serdes {
         }
 
         // TODO: we can also serializes objects of type T using generic Java serialization by default
-        throw new IllegalArgumentException("Unknown class for built-in serializer");
+        throw new IllegalArgumentException("Unknown class for built-in serializer. Supported types are: " +
+            "String, Short, Integer, Long, Float, Double, ByteArray, ByteBuffer, Bytes");
     }
 
     /**

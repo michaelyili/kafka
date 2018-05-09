@@ -20,9 +20,10 @@ import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.processor.internals.MockStreamsMetrics;
-import org.apache.kafka.test.MockProcessorContext;
+import org.apache.kafka.test.InternalMockProcessorContext;
 import org.apache.kafka.test.NoOpRecordCollector;
 import org.apache.kafka.test.TestUtils;
 import org.junit.After;
@@ -40,7 +41,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 
 public class ChangeLoggingKeyValueBytesStoreTest {
 
-    private MockProcessorContext context;
+    private InternalMockProcessorContext context;
     private final InMemoryKeyValueStore<Bytes, byte[]> inner = new InMemoryKeyValueStore<>("kv", Serdes.Bytes(), Serdes.ByteArray());
     private final ChangeLoggingKeyValueBytesStore store = new ChangeLoggingKeyValueBytesStore(inner);
     private final Map sent = new HashMap<>();
@@ -63,36 +64,35 @@ public class ChangeLoggingKeyValueBytesStoreTest {
                 sent.put(key, value);
             }
         };
-        context = new MockProcessorContext(
+        context = new InternalMockProcessorContext(
             TestUtils.tempDirectory(),
             Serdes.String(),
             Serdes.Long(),
             collector,
-            new ThreadCache("testCache", 0, new MockStreamsMetrics(new Metrics())));
+            new ThreadCache(new LogContext("testCache "), 0, new MockStreamsMetrics(new Metrics())));
         context.setTime(0);
         store.init(context, store);
     }
 
     @After
     public void after() {
-        context.close();
         store.close();
     }
 
     @Test
-    public void shouldWriteKeyValueBytesToInnerStoreOnPut() throws Exception {
+    public void shouldWriteKeyValueBytesToInnerStoreOnPut() {
         store.put(hi, there);
         assertThat(inner.get(hi), equalTo(there));
     }
 
     @Test
-    public void shouldLogChangeOnPut() throws Exception {
+    public void shouldLogChangeOnPut() {
         store.put(hi, there);
         assertThat((byte[]) sent.get(hi), equalTo(there));
     }
 
     @Test
-    public void shouldWriteAllKeyValueToInnerStoreOnPutAll() throws Exception {
+    public void shouldWriteAllKeyValueToInnerStoreOnPutAll() {
         store.putAll(Arrays.asList(KeyValue.pair(hi, there),
                                    KeyValue.pair(hello, world)));
         assertThat(inner.get(hi), equalTo(there));
@@ -100,7 +100,7 @@ public class ChangeLoggingKeyValueBytesStoreTest {
     }
 
     @Test
-    public void shouldLogChangesOnPutAll() throws Exception {
+    public void shouldLogChangesOnPutAll() {
         store.putAll(Arrays.asList(KeyValue.pair(hi, there),
                                    KeyValue.pair(hello, world)));
         assertThat((byte[]) sent.get(hi), equalTo(there));
@@ -108,70 +108,72 @@ public class ChangeLoggingKeyValueBytesStoreTest {
     }
 
     @Test
-    public void shouldPutNullOnDelete() throws Exception {
+    public void shouldPropagateDelete() {
         store.put(hi, there);
         store.delete(hi);
+        assertThat(inner.approximateNumEntries(), equalTo(0L));
         assertThat(inner.get(hi), nullValue());
     }
 
     @Test
-    public void shouldReturnOldValueOnDelete() throws Exception {
+    public void shouldReturnOldValueOnDelete() {
         store.put(hi, there);
         assertThat(store.delete(hi), equalTo(there));
     }
 
     @Test
-    public void shouldLogKeyNullOnDelete() throws Exception {
+    public void shouldLogKeyNullOnDelete() {
         store.put(hi, there);
         store.delete(hi);
+        assertThat(sent.containsKey(hi), is(true));
         assertThat(sent.get(hi), nullValue());
     }
 
     @Test
-    public void shouldWriteToInnerOnPutIfAbsentNoPreviousValue() throws Exception {
+    public void shouldWriteToInnerOnPutIfAbsentNoPreviousValue() {
         store.putIfAbsent(hi, there);
         assertThat(inner.get(hi), equalTo(there));
     }
 
     @Test
-    public void shouldNotWriteToInnerOnPutIfAbsentWhenValueForKeyExists() throws Exception {
+    public void shouldNotWriteToInnerOnPutIfAbsentWhenValueForKeyExists() {
         store.put(hi, there);
         store.putIfAbsent(hi, world);
         assertThat(inner.get(hi), equalTo(there));
     }
 
     @Test
-    public void shouldWriteToChangelogOnPutIfAbsentWhenNoPreviousValue() throws Exception {
+    public void shouldWriteToChangelogOnPutIfAbsentWhenNoPreviousValue() {
         store.putIfAbsent(hi, there);
         assertThat((byte[]) sent.get(hi), equalTo(there));
     }
 
     @Test
-    public void shouldNotWriteToChangeLogOnPutIfAbsentWhenValueForKeyExists() throws Exception {
+    public void shouldNotWriteToChangeLogOnPutIfAbsentWhenValueForKeyExists() {
         store.put(hi, there);
         store.putIfAbsent(hi, world);
         assertThat((byte[]) sent.get(hi), equalTo(there));
     }
 
     @Test
-    public void shouldReturnCurrentValueOnPutIfAbsent() throws Exception {
+    public void shouldReturnCurrentValueOnPutIfAbsent() {
         store.put(hi, there);
         assertThat(store.putIfAbsent(hi, world), equalTo(there));
     }
 
     @Test
-    public void shouldReturnNullOnPutIfAbsentWhenNoPreviousValue() throws Exception {
+    public void shouldReturnNullOnPutIfAbsentWhenNoPreviousValue() {
         assertThat(store.putIfAbsent(hi, there), is(nullValue()));
     }
 
     @Test
-    public void shouldReturnValueOnGetWhenExists() throws Exception {
+    public void shouldReturnValueOnGetWhenExists() {
         store.put(hello, world);
         assertThat(store.get(hello), equalTo(world));
     }
 
     @Test
-    public void shouldReturnNullOnGetWhenDoesntExist() throws Exception {
+    public void shouldReturnNullOnGetWhenDoesntExist() {
         assertThat(store.get(hello), is(nullValue()));
     }
 }

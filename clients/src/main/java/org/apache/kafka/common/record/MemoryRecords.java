@@ -16,10 +16,13 @@
  */
 package org.apache.kafka.common.record;
 
+import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.CorruptRecordException;
 import org.apache.kafka.common.record.MemoryRecords.RecordFilter.BatchRetention;
 import org.apache.kafka.common.utils.ByteBufferOutputStream;
 import org.apache.kafka.common.utils.CloseableIterator;
+import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -111,8 +114,20 @@ public class MemoryRecords extends AbstractRecords {
     }
 
     @Override
-    public MemoryRecords downConvert(byte toMagic, long firstOffset) {
-        return downConvert(batches(), toMagic, firstOffset);
+    public ConvertedRecords<MemoryRecords> downConvert(byte toMagic, long firstOffset, Time time) {
+        return downConvert(batches(), toMagic, firstOffset, time);
+    }
+
+    /**
+     * Validates the header of the first batch and returns batch size.
+     * @return first batch size including LOG_OVERHEAD if buffer contains header up to
+     *         magic byte, null otherwise
+     * @throws CorruptRecordException if record size or magic is invalid
+     */
+    public Integer firstBatchSize() {
+        if (buffer.remaining() < HEADER_SIZE_UP_TO_MAGIC)
+            return null;
+        return new ByteBufferLogInputStream(buffer, Integer.MAX_VALUE).nextBatchSize();
     }
 
     /**
@@ -143,7 +158,7 @@ public class MemoryRecords extends AbstractRecords {
         long maxOffset = -1L;
         long shallowOffsetOfMaxTimestamp = -1L;
         int messagesRead = 0;
-        int bytesRead = 0;
+        int bytesRead = 0; // bytes processed from `batches`
         int messagesRetained = 0;
         int bytesRetained = 0;
 
@@ -279,20 +294,34 @@ public class MemoryRecords extends AbstractRecords {
 
     @Override
     public String toString() {
-        Iterator<Record> iter = records().iterator();
         StringBuilder builder = new StringBuilder();
         builder.append('[');
-        while (iter.hasNext()) {
-            Record record = iter.next();
-            builder.append('(');
-            builder.append("record=");
-            builder.append(record);
-            builder.append(")");
-            if (iter.hasNext())
+
+        Iterator<MutableRecordBatch> batchIterator = batches.iterator();
+        while (batchIterator.hasNext()) {
+            RecordBatch batch = batchIterator.next();
+            try (CloseableIterator<Record> recordsIterator = batch.streamingIterator(BufferSupplier.create())) {
+                while (recordsIterator.hasNext()) {
+                    Record record = recordsIterator.next();
+                    appendRecordToStringBuilder(builder, record.toString());
+                    if (recordsIterator.hasNext())
+                        builder.append(", ");
+                }
+            } catch (KafkaException e) {
+                appendRecordToStringBuilder(builder, "CORRUPTED");
+            }
+            if (batchIterator.hasNext())
                 builder.append(", ");
         }
         builder.append(']');
         return builder.toString();
+    }
+
+    private void appendRecordToStringBuilder(StringBuilder builder, String recordAsString) {
+        builder.append('(')
+            .append("record=")
+            .append(recordAsString)
+            .append(")");
     }
 
     @Override
@@ -343,6 +372,8 @@ public class MemoryRecords extends AbstractRecords {
         public final long maxTimestamp;
         public final long shallowOffsetOfMaxTimestamp;
 
+        // Note that `bytesRead` should contain only bytes from batches that have been processed,
+        // i.e. bytes from `messagesRead` and any discarded batches.
         public FilterResult(ByteBuffer output,
                             int messagesRead,
                             int bytesRead,
@@ -492,6 +523,10 @@ public class MemoryRecords extends AbstractRecords {
     public static MemoryRecords withRecords(long initialOffset, CompressionType compressionType, SimpleRecord... records) {
         return withRecords(RecordBatch.CURRENT_MAGIC_VALUE, initialOffset, compressionType, TimestampType.CREATE_TIME,
                 records);
+    }
+
+    public static MemoryRecords withRecords(byte magic, long initialOffset, CompressionType compressionType, SimpleRecord... records) {
+        return withRecords(magic, initialOffset, compressionType, TimestampType.CREATE_TIME, records);
     }
 
     public static MemoryRecords withRecords(long initialOffset, CompressionType compressionType, Integer partitionLeaderEpoch, SimpleRecord... records) {

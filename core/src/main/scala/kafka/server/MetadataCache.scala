@@ -17,18 +17,19 @@
 
 package kafka.server
 
+import java.util.Collections
 import java.util.concurrent.locks.ReentrantReadWriteLock
 
 import scala.collection.{Seq, Set, mutable}
 import scala.collection.JavaConverters._
 import kafka.cluster.{Broker, EndPoint}
 import kafka.api._
-import kafka.common.{BrokerEndPointNotAvailableException, TopicAndPartition}
-import kafka.controller.KafkaController
+import kafka.common.TopicAndPartition
+import kafka.controller.StateChangeLogger
 import kafka.utils.CoreUtils._
 import kafka.utils.Logging
 import org.apache.kafka.common.internals.Topic
-import org.apache.kafka.common.{Node, TopicPartition}
+import org.apache.kafka.common.{Cluster, Node, PartitionInfo, TopicPartition}
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.{MetadataResponse, UpdateMetadataRequest}
@@ -38,14 +39,15 @@ import org.apache.kafka.common.requests.{MetadataResponse, UpdateMetadataRequest
  *  UpdateMetadataRequest from the controller. Every broker maintains the same cache, asynchronously.
  */
 class MetadataCache(brokerId: Int) extends Logging {
-  private val stateChangeLogger = KafkaController.stateChangeLogger
+
   private val cache = mutable.Map[String, mutable.Map[Int, UpdateMetadataRequest.PartitionState]]()
-  private var controllerId: Option[Int] = None
+  @volatile private var controllerId: Option[Int] = None
   private val aliveBrokers = mutable.Map[Int, Broker]()
   private val aliveNodes = mutable.Map[Int, collection.Map[ListenerName, Node]]()
   private val partitionMetadataLock = new ReentrantReadWriteLock()
 
-  this.logIdent = s"[Kafka Metadata Cache on broker $brokerId] "
+  this.logIdent = s"[MetadataCache brokerId=$brokerId] "
+  private val stateChangeLogger = new StateChangeLogger(brokerId, inControllerContext = false, None)
 
   // This method is the main hotspot when it comes to the performance of metadata requests,
   // we should be careful about adding additional logic here.
@@ -102,10 +104,11 @@ class MetadataCache(brokerId: Int) extends Logging {
     }
   }
 
-  def getAliveEndpoint(brokerId: Int, listenerName: ListenerName): Option[Node] =
-    aliveNodes.get(brokerId).map { nodeMap =>
-      nodeMap.getOrElse(listenerName,
-        throw new BrokerEndPointNotAvailableException(s"Broker `$brokerId` does not have listener with name `$listenerName`"))
+  private def getAliveEndpoint(brokerId: Int, listenerName: ListenerName): Option[Node] =
+    inReadLock(partitionMetadataLock) {
+      // Returns None if broker is not alive or if the broker does not have a listener named `listenerName`.
+      // Since listeners can be added dynamically, a broker with a missing listener could be a transient error.
+      aliveNodes.get(brokerId).flatMap(_.get(listenerName))
     }
 
   // errorUnavailableEndpoints exists to support v0 MetadataResponses
@@ -122,6 +125,14 @@ class MetadataCache(brokerId: Int) extends Logging {
   def getAllTopics(): Set[String] = {
     inReadLock(partitionMetadataLock) {
       cache.keySet.toSet
+    }
+  }
+
+  def getAllPartitions(): Map[TopicPartition, UpdateMetadataRequest.PartitionState] = {
+    inReadLock(partitionMetadataLock) {
+      cache.flatMap { case (topic, partitionStates) =>
+        partitionStates.map { case (partition, state ) => (new TopicPartition(topic, partition), state) }
+      }.toMap
     }
   }
 
@@ -178,6 +189,27 @@ class MetadataCache(brokerId: Int) extends Logging {
 
   def getControllerId: Option[Int] = controllerId
 
+  def getClusterMetadata(clusterId: String, listenerName: ListenerName): Cluster = {
+    inReadLock(partitionMetadataLock) {
+      val nodes = aliveNodes.map { case (id, nodes) => (id, nodes.get(listenerName).orNull) }
+      def node(id: Integer): Node = nodes.get(id).orNull
+      val partitions = getAllPartitions()
+        .filter { case (_, state) => state.basePartitionState.leader != LeaderAndIsr.LeaderDuringDelete }
+        .map { case (tp, state) =>
+          new PartitionInfo(tp.topic, tp.partition, node(state.basePartitionState.leader),
+            state.basePartitionState.replicas.asScala.map(node).toArray,
+            state.basePartitionState.isr.asScala.map(node).toArray,
+            state.offlineReplicas.asScala.map(node).toArray)
+        }
+      val unauthorizedTopics = Collections.emptySet[String]
+      val internalTopics = getAllTopics().filter(Topic.isInternal).asJava
+      new Cluster(clusterId, nodes.values.filter(_ != null).toList.asJava,
+        partitions.toList.asJava,
+        unauthorizedTopics, internalTopics,
+        getControllerId.map(id => node(id)).orNull)
+    }
+  }
+
   // This method returns the deleted TopicPartitions received from UpdateMetadataRequest
   def updateCache(correlationId: Int, updateMetadataRequest: UpdateMetadataRequest): Seq[TopicPartition] = {
     inWriteLock(partitionMetadataLock) {
@@ -200,6 +232,11 @@ class MetadataCache(brokerId: Int) extends Logging {
         aliveBrokers(broker.id) = Broker(broker.id, endPoints, Option(broker.rack))
         aliveNodes(broker.id) = nodes.asScala
       }
+      aliveNodes.get(brokerId).foreach { listenerMap =>
+        val listeners = listenerMap.keySet
+        if (!aliveNodes.values.forall(_.keySet == listeners))
+          error(s"Listeners are not identical across brokers: $aliveNodes")
+      }
 
       val deletedPartitions = new mutable.ArrayBuffer[TopicPartition]
       updateMetadataRequest.partitionStates.asScala.foreach { case (tp, info) =>
@@ -207,12 +244,12 @@ class MetadataCache(brokerId: Int) extends Logging {
         val controllerEpoch = updateMetadataRequest.controllerEpoch
         if (info.basePartitionState.leader == LeaderAndIsr.LeaderDuringDelete) {
           removePartitionInfo(tp.topic, tp.partition)
-          stateChangeLogger.trace(s"Broker $brokerId deleted partition $tp from metadata cache in response to UpdateMetadata " +
+          stateChangeLogger.trace(s"Deleted partition $tp from metadata cache in response to UpdateMetadata " +
             s"request sent by controller $controllerId epoch $controllerEpoch with correlation id $correlationId")
           deletedPartitions += tp
         } else {
           addOrUpdatePartitionInfo(tp.topic, tp.partition, info)
-          stateChangeLogger.trace(s"Broker $brokerId cached leader info $info for partition $tp in response to " +
+          stateChangeLogger.trace(s"Cached leader info $info for partition $tp in response to " +
             s"UpdateMetadata request sent by controller $controllerId epoch $controllerEpoch with correlation id $correlationId")
         }
       }
@@ -229,11 +266,11 @@ class MetadataCache(brokerId: Int) extends Logging {
   def contains(tp: TopicPartition): Boolean = getPartitionInfo(tp.topic, tp.partition).isDefined
 
   private def removePartitionInfo(topic: String, partitionId: Int): Boolean = {
-    cache.get(topic).map { infos =>
+    cache.get(topic).exists { infos =>
       infos.remove(partitionId)
       if (infos.isEmpty) cache.remove(topic)
       true
-    }.getOrElse(false)
+    }
   }
 
 }

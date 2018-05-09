@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.streams.processor.internals;
 
+import org.apache.kafka.streams.errors.TaskMigratedException;
 import org.apache.kafka.streams.processor.Cancellable;
 import org.apache.kafka.streams.processor.PunctuationType;
 
@@ -38,7 +39,10 @@ public class PunctuationQueue {
         }
     }
 
-    public boolean mayPunctuate(final long timestamp, final PunctuationType type, final ProcessorNodePunctuator processorNodePunctuator) {
+    /**
+     * @throws TaskMigratedException if the task producer got fenced (EOS only)
+     */
+    boolean mayPunctuate(final long timestamp, final PunctuationType type, final ProcessorNodePunctuator processorNodePunctuator) {
         synchronized (pq) {
             boolean punctuated = false;
             PunctuationSchedule top = pq.peek();
@@ -48,7 +52,10 @@ public class PunctuationQueue {
 
                 if (!sched.isCancelled()) {
                     processorNodePunctuator.punctuate(sched.node(), timestamp, type, sched.punctuator());
-                    pq.add(sched.next(timestamp));
+                    // sched can be cancelled from within the punctuator
+                    if (!sched.isCancelled()) {
+                        pq.add(sched.next(timestamp));
+                    }
                     punctuated = true;
                 }
 

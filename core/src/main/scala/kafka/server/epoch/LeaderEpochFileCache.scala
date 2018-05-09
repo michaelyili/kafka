@@ -96,10 +96,13 @@ class LeaderEpochFileCache(topicPartition: TopicPartition, leo: () => LogOffsetM
   override def endOffsetFor(requestedEpoch: Int): Long = {
     inReadLock(lock) {
       val offset =
-        if (requestedEpoch == latestEpoch) {
+        if (requestedEpoch == UNDEFINED_EPOCH) {
+          // this may happen if a bootstrapping follower sends a request with undefined epoch or
+          // a follower is on the older message format where leader epochs are not recorded
+          UNDEFINED_EPOCH_OFFSET
+        } else if (requestedEpoch == latestEpoch) {
           leo().messageOffset
-        }
-        else {
+        } else {
           val subsequentEpochs = epochs.filter(e => e.epoch > requestedEpoch)
           if (subsequentEpochs.isEmpty || requestedEpoch < epochs.head.epoch)
             UNDEFINED_EPOCH_OFFSET
@@ -140,7 +143,7 @@ class LeaderEpochFileCache(topicPartition: TopicPartition, leo: () => LogOffsetM
       val before = epochs
       if (offset >= 0 && earliestOffset() < offset) {
         val earliest = epochs.filter(entry => entry.startOffset < offset)
-        if (earliest.size > 0) {
+        if (earliest.nonEmpty) {
           epochs = epochs --= earliest
           //If the offset is less than the earliest offset remaining, add previous epoch back, but with an updated offset
           if (offset < earliestOffset() || epochs.isEmpty)
@@ -184,7 +187,7 @@ class LeaderEpochFileCache(topicPartition: TopicPartition, leo: () => LogOffsetM
     checkpoint.write(epochs)
   }
 
-  def epochChangeMsg(epoch: Int, offset: Long) = s"New: {epoch:$epoch, offset:$offset}, Current: {epoch:$latestEpoch, offset$latestOffset} for Partition: $topicPartition"
+  def epochChangeMsg(epoch: Int, offset: Long) = s"New: {epoch:$epoch, offset:$offset}, Current: {epoch:$latestEpoch, offset:$latestOffset} for Partition: $topicPartition"
 
   def validateAndMaybeWarn(epoch: Int, offset: Long) = {
     assert(epoch >= 0, s"Received a PartitionLeaderEpoch assignment for an epoch < 0. This should not happen. ${epochChangeMsg(epoch, offset)}")
